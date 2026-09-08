@@ -1,0 +1,12 @@
+[package]
+name = "bank-domain"
+edition.workspace = true
+version.workspace = true
+description = "银行核心领域层:纯 Rust、零 IO、时钟注入(确定性内核)"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

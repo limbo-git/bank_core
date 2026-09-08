@@ -1,0 +1,16 @@
+[package]
+name = "bank-store"
+edition.workspace = true
+version.workspace = true
+description = "银行核心存储层:sqlx + PostgreSQL(命令账/分录/投影/迁移)"
+
+[dependencies]
+bank-domain = { path = "../bank-domain" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+bank-domain = { path = "../bank-domain" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
