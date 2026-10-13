@@ -24,15 +24,44 @@ async fn test_pool() -> Option<PgPool> {
     let name = std::env::var("BANK_DB_NAME").ok()?;
     let user = std::env::var("BANK_DB_USER").ok()?;
     let password = std::env::var("BANK_DB_PASSWORD").ok()?;
+    let owner_user = std::env::var("BANK_DB_OWNER_USER").ok()?;
+    let owner_password = std::env::var("BANK_DB_OWNER_PASSWORD").ok()?;
     let test_name = format!("{name}_test");
-    let url = format!("postgres://{user}:{password}@{host}:{port}/{test_name}");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(16)
-        .connect(&url)
+
+    // 迁移以属主身份执行(bank_app 无 DDL 权限)
+    let owner_url = format!("postgres://{owner_user}:{owner_password}@{host}:{port}/{test_name}");
+    let owner_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&owner_url)
         .await
         .ok()?;
-    bank_store::migrate(&pool).await.ok()?;
+    bank_store::migrate(&owner_pool).await.ok()?;
+    owner_pool.close().await;
+
+    // 业务连接使用最小权限的应用角色
+    let app_url = format!("postgres://{user}:{password}@{host}:{port}/{test_name}");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(16)
+        .connect(&app_url)
+        .await
+        .ok()?;
     Some(pool)
+}
+
+/// 属主连接(仅用于测试中的"人为注入错误"等需要越权改动的场景)
+async fn owner_pool() -> Option<PgPool> {
+    let host = std::env::var("BANK_DB_HOST").ok()?;
+    let port = std::env::var("BANK_DB_PORT").ok()?;
+    let name = std::env::var("BANK_DB_NAME").ok()?;
+    let owner_user = std::env::var("BANK_DB_OWNER_USER").ok()?;
+    let owner_password = std::env::var("BANK_DB_OWNER_PASSWORD").ok()?;
+    let test_name = format!("{name}_test");
+    let url = format!("postgres://{owner_user}:{owner_password}@{host}:{port}/{test_name}");
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .ok()
 }
 
 async fn open(pool: &PgPool, tag: &str) -> String {
@@ -101,21 +130,28 @@ async fn tb1_存取转账_余额流水与试算平衡() {
     let sides: Vec<&str> = ea.iter().map(|e| e.side.as_str()).collect();
     assert_eq!(sides, vec!["debit", "debit", "credit"]); // id 倒序:转出 debit/取款 debit/存款 credit
 
-    // 试算平衡不变式:现金(1001)与客户存款(2001)总额始终相等
-    // (不断言绝对值——集成测试并行共享一库,其他用例的存款已计入)
+    // 试算平衡不变式:Σ debit-normal 科目余额 == Σ credit-normal 科目余额
+    // (注意:计息入账会同时抬高 6601 利息费用与 2001 存款,故不能用"现金=存款"这种窄等式;
+    //  金额也只做下界断言——集成测试并行共享一库,其他用例的流水已计入)
     let sheet = queries::balance_sheet(&pool).await.unwrap();
-    let cash = sheet
+    let debit_total: i64 = sheet
         .iter()
-        .find(|r| r.code == "1001")
-        .unwrap()
-        .balance_cents;
-    let dep = sheet
+        .filter(|r| r.normal_side == "debit")
+        .map(|r| r.balance_cents)
+        .sum();
+    let credit_total: i64 = sheet
         .iter()
-        .find(|r| r.code == "2001")
-        .unwrap()
-        .balance_cents;
-    assert!(cash >= 7000, "至少含本用例的 7000 分: {cash}");
-    assert_eq!(cash, dep, "现金与客户存款总额必须相等(复式记账不变式)");
+        .filter(|r| r.normal_side == "credit")
+        .map(|r| r.balance_cents)
+        .sum();
+    assert!(
+        debit_total >= 7000 && credit_total >= 7000,
+        "至少含本用例的 7000 分: 借 {debit_total} / 贷 {credit_total}"
+    );
+    assert_eq!(
+        debit_total, credit_total,
+        "试算平衡:Σ借方科目余额必须等于 Σ贷方科目余额"
+    );
 }
 
 // ---------- T-B2 失败路径 ----------
@@ -264,12 +300,16 @@ async fn tb4_自转账被拒_分录不可变() {
         eprintln!("SKIP: 缺 BANK_DB_* 环境变量");
         return;
     };
+    let Some(owner) = owner_pool().await else {
+        eprintln!("SKIP: 缺 BANK_DB_OWNER_* 环境变量");
+        return;
+    };
     let a = open(&pool, "TB4-A").await;
 
     // 自转账在构造层拒绝
     assert!(Transfer::new(a.clone(), a.clone(), 100).is_err());
 
-    // 对已落分录直接 UPDATE → 触发器拒绝
+    // 落一笔真实分录
     execute_command(
         &pool,
         &unique("k"),
@@ -277,18 +317,41 @@ async fn tb4_自转账被拒_分录不可变() {
     )
     .await
     .unwrap();
-    let (eid,): (i64,) = sqlx::query_as("SELECT id FROM ledger_entry LIMIT 1")
+    let (eid,): (i64,) = sqlx::query_as("SELECT id FROM ledger_entry ORDER BY id DESC LIMIT 1")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let res = sqlx::query("UPDATE ledger_entry SET amount_cents = amount_cents + 1 WHERE id = $1")
+
+    // 应用角色:权限层先挡住
+    let app_err =
+        sqlx::query("UPDATE ledger_entry SET amount_cents = amount_cents + 1 WHERE id = $1")
+            .bind(eid)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert!(
+        app_err.to_string().contains("权限") || app_err.to_string().contains("permission"),
+        "应用角色的改分录应被权限拒绝: {app_err}"
+    );
+
+    // 属主(权限上合法):触发器必须拒绝,且信息里点明"不可变"
+    let owner_err =
+        sqlx::query("UPDATE ledger_entry SET amount_cents = amount_cents + 1 WHERE id = $1")
+            .bind(eid)
+            .execute(&owner)
+            .await
+            .unwrap_err();
+    assert!(
+        owner_err.to_string().contains("不可变"),
+        "属主改分录应被触发器拒绝: {owner_err}"
+    );
+    let owner_del = sqlx::query("DELETE FROM ledger_entry WHERE id = $1")
         .bind(eid)
-        .execute(&pool)
-        .await;
-    assert!(res.is_err(), "分录 UPDATE 必须被触发器拒绝");
-    let res = sqlx::query("DELETE FROM ledger_entry WHERE id = $1")
-        .bind(eid)
-        .execute(&pool)
-        .await;
-    assert!(res.is_err(), "分录 DELETE 必须被触发器拒绝");
+        .execute(&owner)
+        .await
+        .unwrap_err();
+    assert!(
+        owner_del.to_string().contains("不可变"),
+        "属主删分录应被触发器拒绝: {owner_del}"
+    );
 }

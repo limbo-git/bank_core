@@ -1,0 +1,17 @@
+[package]
+name = "bank-bench"
+edition.workspace = true
+version.workspace = true
+description = "银行核心压测器:S1 均匀 / S2 热点 / S3 混合;引擎路径 vs 裸 PG 对照"
+
+[[bin]]
+name = "bank-bench"
+path = "src/main.rs"
+
+[dependencies]
+bank-domain = { path = "../bank-domain" }
+bank-reconciler = { path = "../bank-reconciler" }
+bank-store = { path = "../bank-store" }
+serde_json.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

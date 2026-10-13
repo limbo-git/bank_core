@@ -12,3 +12,7 @@ sqlx.workspace = true
 tokio.workspace = true
 bank-domain = { path = "../bank-domain" }
 bank-store = { path = "../bank-store" }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

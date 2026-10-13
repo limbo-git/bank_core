@@ -10,7 +10,9 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 bank-domain = { path = "../bank-domain" }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+bank-reconciler = { path = "../bank-reconciler" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

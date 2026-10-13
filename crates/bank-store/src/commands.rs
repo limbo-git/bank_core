@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 
-use bank_domain::{Command, DomainError, LedgerSide, OpenAccount, Transfer};
+use bank_domain::{
+    Command, DomainError, LedgerSide, OpenAccount, Reverse, RunEod, SettleInterest, Transfer,
+};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -90,42 +92,76 @@ async fn coa_by_code<'a>(
         .ok_or_else(|| StoreError::Internal(format!("缺少科目 {code}")))
 }
 
-/// 锁定账户(WHERE ... ORDER BY account_no FOR UPDATE,排序防死锁);缺失即报错
+/// 锁定账户(严格按 account_no 升序**逐个**加锁 → 全局加锁顺序,杜绝死锁);缺失即报错。
+///
+/// 两个踩过的坑:
+/// 1. `WHERE no = ANY($1) ORDER BY no FOR UPDATE` **不保证**加锁顺序 = ORDER BY 顺序
+///    (锁在行产出过程中获取),并发随机账户对会成环死锁 —— 必须逐个按序加锁。
+/// 2. 不 JOIN 参考表 coa:FOR UPDATE 要求对涉及表有 UPDATE 权限,而 coa 只授予 SELECT。
 async fn lock_accounts<'a>(
     tx: &mut Transaction<'a, Postgres>,
     account_nos: &[&str],
 ) -> Result<Vec<AccountLocked>, StoreError> {
-    let rows: Vec<(i64, String, i64, String, i64, String)> = sqlx::query_as(
-        "SELECT a.id, a.account_no, a.coa_id, a.status, a.balance_cents, c.normal_side AS coa_normal_side
-           FROM account a
-           JOIN coa c ON c.id = a.coa_id
-          WHERE a.account_no = ANY($1)
-          ORDER BY a.account_no
-          FOR UPDATE",
-    )
-    .bind(account_nos)
-    .fetch_all(&mut **tx)
-    .await?;
-    if rows.len() != account_nos.len() {
-        let missing = account_nos
-            .iter()
-            .find(|no| !rows.iter().any(|r| r.1 == **no))
-            .unwrap_or(&"");
-        return Err(StoreError::NotFound(missing.to_string()));
-    }
-    Ok(rows
-        .into_iter()
-        .map(
-            |(id, account_no, coa_id, status, balance_cents, coa_normal_side)| AccountLocked {
-                id,
-                account_no,
-                coa_id,
-                status,
-                balance_cents,
-                coa_normal_side,
-            },
+    let mut sorted: Vec<String> = account_nos.iter().map(|s| s.to_string()).collect();
+    sorted.sort();
+    sorted.dedup();
+
+    let mut locked = Vec::with_capacity(sorted.len());
+    for no in &sorted {
+        let row: Option<(i64, String, i64, String, i64)> = sqlx::query_as(
+            "SELECT a.id, a.account_no, a.coa_id, a.status, a.balance_cents
+               FROM account a
+              WHERE a.account_no = $1
+              FOR UPDATE",
         )
-        .collect())
+        .bind(no)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let (id, account_no, coa_id, status, balance_cents) =
+            row.ok_or_else(|| StoreError::NotFound(no.clone()))?;
+        locked.push(AccountLocked {
+            id,
+            account_no,
+            coa_id,
+            status,
+            balance_cents,
+            coa_normal_side: String::new(), // 稍后填充
+        });
+    }
+
+    let coa_ids: Vec<i64> = locked.iter().map(|a| a.coa_id).collect();
+    let coas: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, normal_side FROM coa WHERE id = ANY($1)")
+            .bind(&coa_ids)
+            .fetch_all(&mut **tx)
+            .await?;
+    let normal: HashMap<i64, String> = coas.into_iter().collect();
+    for acc in &mut locked {
+        acc.coa_normal_side = normal.get(&acc.coa_id).cloned().ok_or_else(|| {
+            StoreError::Internal(format!(
+                "账户 {} 引用科目 {} 不存在",
+                acc.account_no, acc.coa_id
+            ))
+        })?;
+    }
+    Ok(locked)
+}
+
+/// 按账户 id 升序逐个加锁(冲正/计息路径,同样保证全局加锁顺序)
+async fn lock_accounts_by_ids<'a>(
+    tx: &mut Transaction<'a, Postgres>,
+    ids: &[i64],
+) -> Result<(), StoreError> {
+    let mut sorted: Vec<i64> = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    for id in sorted {
+        sqlx::query("SELECT 1 FROM account WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 fn require_active(acc: &AccountLocked) -> Result<(), StoreError> {
@@ -151,6 +187,13 @@ fn payload_of(cmd: &Command) -> Value {
             "to_account_no": t.to_account_no,
             "amount_cents": t.amount.cents(),
         }),
+        Command::Reverse(r) => json!({ "target_idempotency_key": r.target_idempotency_key }),
+        Command::SettleInterest(s) => json!({
+            "period_start": s.period_start,
+            "period_end": s.period_end,
+            "annual_rate_bp": s.annual_rate_bp,
+        }),
+        Command::RunEod(e) => json!({ "day": e.day }),
     }
 }
 
@@ -180,19 +223,30 @@ pub async fn execute_command(
         });
     }
 
-    // 2-4. 执行(校验 + 分录 + 投影)
-    let result = match cmd {
-        Command::OpenAccount(o) => execute_open_account(&mut tx, command_id, o).await?,
-        Command::Deposit(d) => execute_deposit(&mut tx, command_id, d).await?,
-        Command::Withdraw(w) => execute_withdraw(&mut tx, command_id, w).await?,
-        Command::Transfer(t) => execute_transfer(&mut tx, command_id, t).await?,
+    // 2-4. 执行(校验 + 分录 + 投影);Reverse 额外登记"冲正了哪条原命令"
+    let (result, reverses_target) = match cmd {
+        Command::OpenAccount(o) => (execute_open_account(&mut tx, command_id, o).await?, None),
+        Command::Deposit(d) => (execute_deposit(&mut tx, command_id, d).await?, None),
+        Command::Withdraw(w) => (execute_withdraw(&mut tx, command_id, w).await?, None),
+        Command::Transfer(t) => (execute_transfer(&mut tx, command_id, t).await?, None),
+        Command::Reverse(r) => {
+            let (v, orig_id) = execute_reverse(&mut tx, command_id, r).await?;
+            (v, Some(orig_id))
+        }
+        Command::SettleInterest(s) => {
+            (execute_settle_interest(&mut tx, command_id, s).await?, None)
+        }
+        Command::RunEod(e) => (execute_run_eod(&mut tx, e).await?, None),
     };
 
     sqlx::query(
-        "UPDATE command_log SET status = 'committed', result = $2::jsonb, committed_at = now() WHERE id = $1",
+        "UPDATE command_log
+            SET status = 'committed', result = $2::jsonb, committed_at = now(), reverses_command_id = $3
+          WHERE id = $1",
     )
     .bind(command_id)
     .bind(&result)
+    .bind(reverses_target)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -249,10 +303,20 @@ async fn insert_entries<'a>(
     command_id: i64,
     plans: &[EntryPlan],
 ) -> Result<(), StoreError> {
+    insert_entries_with_reversal(tx, command_id, plans, None).await
+}
+
+/// 追加分录;reverses 为 Some 时记录"本条分录属于对某原命令的冲正"
+async fn insert_entries_with_reversal<'a>(
+    tx: &mut Transaction<'a, Postgres>,
+    command_id: i64,
+    plans: &[EntryPlan],
+    reverses: Option<i64>,
+) -> Result<(), StoreError> {
     for p in plans {
         sqlx::query(
-            "INSERT INTO ledger_entry (command_id, seq, coa_id, account_id, side, amount_cents)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO ledger_entry (command_id, seq, coa_id, account_id, side, amount_cents, reverses_command_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(command_id)
         .bind(p.seq)
@@ -260,13 +324,18 @@ async fn insert_entries<'a>(
         .bind(p.account_id)
         .bind(p.side.as_str())
         .bind(p.amount_cents)
+        .bind(reverses)
         .execute(&mut **tx)
         .await?;
     }
     Ok(())
 }
 
-/// 按分录折算带符号增量,更新账户 / 科目余额投影(同事务,CHECK >= 0 兜底)
+/// 按分录折算带符号增量,更新账户 / 科目余额投影(同事务,CHECK >= 0 兜底)。
+///
+/// 关键:更新顺序必须**全局确定**(按 id 升序),否则一条命令涉及多行投影时
+/// (存款/取款改"现金 + 客户存款"两行、计息改多账户)并发下会成环死锁。
+/// HashMap 迭代顺序随机 —— 踩过这个坑(压测时表现为 coa_balance 上大量死锁)。
 async fn apply_projection<'a>(
     tx: &mut Transaction<'a, Postgres>,
     plans: &[EntryPlan],
@@ -280,24 +349,41 @@ async fn apply_projection<'a>(
         }
         *coa_delta.entry(p.coa_id).or_insert(0) += delta;
     }
-    for (acc_id, delta) in account_delta {
-        if delta != 0 {
+
+    // 确定性顺序:账户按 id 升序 → 科目按 id 升序(与加锁顺序一致)
+    let mut acc_items: Vec<(i64, i64)> =
+        account_delta.into_iter().filter(|(_, d)| *d != 0).collect();
+    acc_items.sort_unstable_by_key(|(id, _)| *id);
+    let mut coa_items: Vec<(i64, i64)> = coa_delta.into_iter().filter(|(_, d)| *d != 0).collect();
+    coa_items.sort_unstable_by_key(|(id, _)| *id);
+
+    for (acc_id, delta) in acc_items {
+        let res =
             sqlx::query("UPDATE account SET balance_cents = balance_cents + $2 WHERE id = $1")
                 .bind(acc_id)
                 .bind(delta)
                 .execute(&mut **tx)
                 .await?;
+        if res.rows_affected() != 1 {
+            return Err(StoreError::Internal(format!(
+                "账户投影更新影响了 {} 行(应为 1),id={acc_id}",
+                res.rows_affected()
+            )));
         }
     }
-    for (coa_id, delta) in coa_delta {
-        if delta != 0 {
-            sqlx::query(
-                "UPDATE coa_balance SET balance_cents = balance_cents + $2 WHERE coa_id = $1",
-            )
-            .bind(coa_id)
-            .bind(delta)
-            .execute(&mut **tx)
-            .await?;
+    for (coa_id, delta) in coa_items {
+        let res = sqlx::query(
+            "UPDATE coa_balance SET balance_cents = balance_cents + $2 WHERE coa_id = $1",
+        )
+        .bind(coa_id)
+        .bind(delta)
+        .execute(&mut **tx)
+        .await?;
+        if res.rows_affected() != 1 {
+            return Err(StoreError::Internal(format!(
+                "科目投影更新影响了 {} 行(应为 1),coa_id={coa_id}(投影行缺失会导致静默漂移)",
+                res.rows_affected()
+            )));
         }
     }
     Ok(())
@@ -461,5 +547,339 @@ async fn execute_transfer<'a>(
         "to_account_no": t.to_account_no,
         "from_balance_cents": from.balance_cents - amount,
         "to_balance_cents": to.balance_cents + amount,
+    }))
+}
+
+// ---------- M3:冲正 / 计息 / 日切 ----------
+
+const INTEREST_EXPENSE_COA_CODE: &str = "6601";
+/// 计息分母:年利率以 bp(万分之几)表示,全年 360 天 ⇒ 10_000 × 360
+const INTEREST_DENOM: i128 = 10_000 * 360;
+
+/// 冲正:按原分录逐条追加反向分录(原流水永不改动),并引用原命令。
+/// 规则(方案 Q21):仅全额、每笔原交易限一次、不允许冲正冲正命令。
+/// 若冲正会使账户余额或现金池为负(钱已被花掉)则拒绝,返回明确错误。
+async fn execute_reverse<'a>(
+    tx: &mut Transaction<'a, Postgres>,
+    command_id: i64,
+    r: &Reverse,
+) -> Result<(Value, i64), StoreError> {
+    let orig: Option<(i64, String, String)> = sqlx::query_as(
+        "SELECT id, command_type, status FROM command_log WHERE idempotency_key = $1 FOR UPDATE",
+    )
+    .bind(&r.target_idempotency_key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (orig_id, orig_type, orig_status) =
+        orig.ok_or_else(|| StoreError::OriginalNotFound(r.target_idempotency_key.clone()))?;
+    if orig_status != "committed" {
+        return Err(StoreError::NotReversible(format!(
+            "{} 状态为 {orig_status}",
+            r.target_idempotency_key
+        )));
+    }
+    if orig_type == "open_account" {
+        return Err(StoreError::NotReversible("开户命令无分录可冲".into()));
+    }
+    if orig_type == "reverse" {
+        return Err(StoreError::NotReversible("不允许冲正冲正命令".into()));
+    }
+    let already: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM command_log WHERE reverses_command_id = $1 LIMIT 1")
+            .bind(orig_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if already.is_some() {
+        return Err(StoreError::AlreadyReversed(
+            r.target_idempotency_key.clone(),
+        ));
+    }
+
+    let rows: Vec<(i16, i64, Option<i64>, String, i64)> = sqlx::query_as(
+        "SELECT seq, coa_id, account_id, side, amount_cents
+           FROM ledger_entry WHERE command_id = $1 ORDER BY seq",
+    )
+    .bind(orig_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if rows.is_empty() {
+        return Err(StoreError::NotReversible("原命令无分录可冲".into()));
+    }
+
+    // 锁定涉及账户(排序防死锁)
+    let mut acc_ids: Vec<i64> = rows.iter().filter_map(|r| r.2).collect();
+    acc_ids.sort_unstable();
+    acc_ids.dedup();
+    // 锁定涉及账户(按 id 升序逐个加锁,保证全局加锁顺序)
+    lock_accounts_by_ids(tx, &acc_ids).await?;
+    let account_balances: HashMap<i64, i64> = if acc_ids.is_empty() {
+        HashMap::new()
+    } else {
+        sqlx::query_as::<_, (i64, i64)>("SELECT id, balance_cents FROM account WHERE id = ANY($1)")
+            .bind(&acc_ids)
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .collect()
+    };
+
+    // 科目方向(coa 只读;余额行单独加锁,避免 FOR UPDATE 触到参考表)
+    let mut coa_ids: Vec<i64> = rows.iter().map(|r| r.1).collect();
+    coa_ids.sort_unstable();
+    coa_ids.dedup();
+    let normal: HashMap<i64, String> =
+        sqlx::query_as::<_, (i64, String)>("SELECT id, normal_side FROM coa WHERE id = ANY($1)")
+            .bind(&coa_ids)
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .collect();
+    // 科目投影行:同样按 coa_id 升序逐个加锁(避免成环)
+    let coa_balances: HashMap<i64, i64> = {
+        let mut rows = Vec::new();
+        for coa_id in &coa_ids {
+            let bal: Option<i64> = sqlx::query_scalar(
+                "SELECT balance_cents FROM coa_balance WHERE coa_id = $1 FOR UPDATE",
+            )
+            .bind(coa_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            rows.push((*coa_id, bal.unwrap_or(0)));
+        }
+        rows.into_iter().collect()
+    };
+
+    // 构造反向分录
+    let mut plans = Vec::with_capacity(rows.len());
+    for (seq, coa_id, account_id, side, amount_cents) in rows {
+        let flipped = if side == "debit" {
+            LedgerSide::Credit
+        } else {
+            LedgerSide::Debit
+        };
+        let coa_normal_side = normal
+            .get(&coa_id)
+            .cloned()
+            .ok_or_else(|| StoreError::Internal(format!("分录引用科目 {coa_id} 不存在")))?;
+        plans.push(EntryPlan {
+            seq,
+            coa_id,
+            account_id,
+            side: flipped,
+            amount_cents,
+            coa_normal_side,
+        });
+    }
+
+    // 预检:不得把账户或科目余额冲成负数
+    let mut acc_delta: HashMap<i64, i64> = HashMap::new();
+    let mut coa_delta: HashMap<i64, i64> = HashMap::new();
+    for p in &plans {
+        let d = signed_delta(&p.coa_normal_side, p.side, p.amount_cents);
+        if let Some(a) = p.account_id {
+            *acc_delta.entry(a).or_insert(0) += d;
+        }
+        *coa_delta.entry(p.coa_id).or_insert(0) += d;
+    }
+    for (acc_id, d) in &acc_delta {
+        let bal = account_balances.get(acc_id).copied().unwrap_or(0);
+        if bal + d < 0 {
+            return Err(StoreError::WouldOverdraw(format!(
+                "账户 id={acc_id} 余额 {bal} 分,冲正后将为 {} 分",
+                bal + d
+            )));
+        }
+    }
+    for (coa_id, d) in &coa_delta {
+        let bal = coa_balances.get(coa_id).copied().unwrap_or(0);
+        if bal + d < 0 {
+            return Err(StoreError::WouldOverdraw(format!(
+                "科目 id={coa_id} 余额 {bal} 分,冲正后将为 {} 分",
+                bal + d
+            )));
+        }
+    }
+
+    insert_entries_with_reversal(tx, command_id, &plans, Some(orig_id)).await?;
+    apply_projection(tx, &plans).await?;
+    Ok((
+        json!({
+            "reversed_command": r.target_idempotency_key,
+            "reversed_type": orig_type,
+            "entries": plans.len(),
+        }),
+        orig_id,
+    ))
+}
+
+/// 区间计息:Σ(日终余额 × 年利率 bp) ÷ (10000 × 360),四舍五入到分,结算日一次入账。
+/// 借 6601 利息费用 / 贷 客户存款;同一区间只能结算一次(interest_settlement 唯一约束)。
+async fn execute_settle_interest<'a>(
+    tx: &mut Transaction<'a, Postgres>,
+    command_id: i64,
+    s: &SettleInterest,
+) -> Result<Value, StoreError> {
+    let exists: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM interest_settlement WHERE period_start = $1::date AND period_end = $2::date",
+    )
+    .bind(&s.period_start)
+    .bind(&s.period_end)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if exists.is_some() {
+        return Err(StoreError::PeriodAlreadySettled(format!(
+            "{} → {}",
+            s.period_start, s.period_end
+        )));
+    }
+    sqlx::query(
+        "INSERT INTO interest_settlement (period_start, period_end, annual_rate_bp)
+         VALUES ($1::date, $2::date, $3)",
+    )
+    .bind(&s.period_start)
+    .bind(&s.period_end)
+    .bind(s.annual_rate_bp)
+    .execute(&mut **tx)
+    .await?;
+
+    // 日积数:Σ 区间内各日终余额
+    let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT a.id, a.account_no, a.coa_id, COALESCE(sum(adb.balance_cents), 0)::bigint AS 积数
+           FROM account a
+           JOIN account_daily_balance adb ON adb.account_id = a.id
+          WHERE adb.day >= $1::date AND adb.day < $2::date
+          GROUP BY a.id, a.account_no, a.coa_id
+          ORDER BY a.id",
+    )
+    .bind(&s.period_start)
+    .bind(&s.period_end)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let expense_coa = coa_by_code(tx, INTEREST_EXPENSE_COA_CODE).await?;
+    if rows.is_empty() {
+        return Ok(json!({
+            "period_start": s.period_start,
+            "period_end": s.period_end,
+            "annual_rate_bp": s.annual_rate_bp,
+            "total_interest_cents": 0,
+            "accounts_credited": 0,
+            "accounts_considered": 0,
+        }));
+    }
+
+    // 锁定涉及账户(按 id 升序逐个加锁)
+    let acc_ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    lock_accounts_by_ids(tx, &acc_ids).await?;
+
+    let mut coa_ids: Vec<i64> = rows.iter().map(|r| r.2).collect();
+    coa_ids.push(expense_coa.id);
+    coa_ids.sort_unstable();
+    coa_ids.dedup();
+    let normal: HashMap<i64, String> =
+        sqlx::query_as::<_, (i64, String)>("SELECT id, normal_side FROM coa WHERE id = ANY($1)")
+            .bind(&coa_ids)
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .collect();
+
+    let mut plans: Vec<EntryPlan> = Vec::new();
+    let mut seq: i16 = 0;
+    let mut total: i64 = 0;
+    let mut credited: i64 = 0;
+    for (acc_id, _account_no, coa_id, 积数) in &rows {
+        let numerator = (*积数 as i128) * (s.annual_rate_bp as i128);
+        let cents_i128 = (numerator + INTEREST_DENOM / 2) / INTEREST_DENOM; // 四舍五入到分
+        if cents_i128 <= 0 {
+            continue; // 不足 1 分不计提,避免产生 0 金额分录
+        }
+        let cents = i64::try_from(cents_i128)
+            .map_err(|_| StoreError::Internal("利息金额溢出 i64".into()))?;
+        total = total
+            .checked_add(cents)
+            .ok_or_else(|| StoreError::Internal("利息合计溢出 i64".into()))?;
+        credited += 1;
+        let acc_normal = normal
+            .get(coa_id)
+            .cloned()
+            .ok_or_else(|| StoreError::Internal(format!("账户科目 {coa_id} 缺失")))?;
+        plans.push(EntryPlan {
+            seq,
+            coa_id: expense_coa.id,
+            account_id: None,
+            side: LedgerSide::Debit,
+            amount_cents: cents,
+            coa_normal_side: expense_coa.normal_side.clone(),
+        });
+        seq += 1;
+        plans.push(EntryPlan {
+            seq,
+            coa_id: *coa_id,
+            account_id: Some(*acc_id),
+            side: LedgerSide::Credit,
+            amount_cents: cents,
+            coa_normal_side: acc_normal,
+        });
+        seq += 1;
+    }
+    if !plans.is_empty() {
+        insert_entries(tx, command_id, &plans).await?;
+        apply_projection(tx, &plans).await?;
+    }
+    Ok(json!({
+        "period_start": s.period_start,
+        "period_end": s.period_end,
+        "annual_rate_bp": s.annual_rate_bp,
+        "total_interest_cents": total,
+        "accounts_credited": credited,
+        "accounts_considered": rows.len(),
+    }))
+}
+
+/// 轻量日切:指定日期做日终快照 + 试算平衡。closed_at 由 day 推导(可重放)。
+async fn execute_run_eod<'a>(
+    tx: &mut Transaction<'a, Postgres>,
+    e: &RunEod,
+) -> Result<Value, StoreError> {
+    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM eod_snapshot WHERE day = $1::date")
+        .bind(&e.day)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if exists.is_some() {
+        return Err(StoreError::DayAlreadyClosed(e.day.clone()));
+    }
+    let (debit_total, credit_total): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(sum(cb.balance_cents) FILTER (WHERE c.normal_side = 'debit'), 0)::bigint,
+                COALESCE(sum(cb.balance_cents) FILTER (WHERE c.normal_side = 'credit'), 0)::bigint
+           FROM coa_balance cb JOIN coa c ON c.id = cb.coa_id",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let balanced = debit_total == credit_total;
+
+    sqlx::query(
+        "INSERT INTO eod_snapshot (day, closed_at, balanced)
+         VALUES ($1::date, ($1::date + time '23:59:59') AT TIME ZONE 'UTC', $2)",
+    )
+    .bind(&e.day)
+    .bind(balanced)
+    .execute(&mut **tx)
+    .await?;
+
+    let snap = sqlx::query(
+        "INSERT INTO account_daily_balance (account_id, day, balance_cents)
+         SELECT id, $1::date, balance_cents FROM account",
+    )
+    .bind(&e.day)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(json!({
+        "day": e.day,
+        "accounts_snapshotted": snap.rows_affected(),
+        "balanced": balanced,
+        "debit_side_total_cents": debit_total,
+        "credit_side_total_cents": credit_total,
     }))
 }

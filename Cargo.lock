@@ -88,7 +88,21 @@ dependencies = [
  "axum",
  "bank-domain",
  "bank-store",
+ "http-body-util",
  "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "bank-bench"
+version = "0.1.0"
+dependencies = [
+ "bank-domain",
+ "bank-reconciler",
+ "bank-store",
  "serde_json",
  "sqlx",
  "tokio",
@@ -104,10 +118,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bank-reconciler"
+version = "0.1.0"
+dependencies = [
+ "bank-domain",
+ "bank-store",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "bank-store"
 version = "0.1.0"
 dependencies = [
  "bank-domain",
+ "bank-reconciler",
  "serde",
  "serde_json",
  "sqlx",

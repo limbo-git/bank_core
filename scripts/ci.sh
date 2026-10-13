@@ -9,6 +9,11 @@ if [ -f ~/.env/database.env ]; then
   set -a; source ~/.env/database.env; set +a
 fi
 
+# 确保角色/库/属主齐备(幂等;需要 superuser 凭据)
+if [ -n "${PG_SUPERUSER_PASSWORD:-}" ] && [ -x ./scripts/bootstrap_db.sh ]; then
+  ./scripts/bootstrap_db.sh >/dev/null
+fi
+
 echo "==> cargo fmt --check"
 cargo fmt -- --check
 

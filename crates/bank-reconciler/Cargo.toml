@@ -1,0 +1,16 @@
+[package]
+name = "bank-reconciler"
+edition.workspace = true
+version.workspace = true
+description = "独立对账工具:不依赖引擎代码,用独立 SQL 复核账务一致性(可作事后仲裁)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+bank-domain = { path = "../bank-domain" }
+bank-store = { path = "../bank-store" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

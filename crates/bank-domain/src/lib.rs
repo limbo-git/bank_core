@@ -8,7 +8,9 @@ pub mod error;
 pub mod money;
 pub mod types;
 
-pub use commands::{Command, Deposit, OpenAccount, Transfer, Withdraw};
+pub use commands::{
+    Command, Deposit, OpenAccount, Reverse, RunEod, SettleInterest, Transfer, Withdraw,
+};
 pub use error::DomainError;
 pub use money::Money;
 pub use types::{CommandStatus, CommandType, LedgerSide};
